@@ -27,6 +27,7 @@ const (
 	ahClientVersion = "9.28"
 	ahUserAgent     = "Appie/9.28 (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)"
 	oauthTimeout    = 5 * time.Minute
+	appieRedirect   = "appie://login-exit"
 	loginDonePath   = "/login-done"
 	loginDoneGrace  = 15 * time.Second
 	tokenRefreshBuf = 60 * time.Second
@@ -157,15 +158,15 @@ func RefreshIfNeeded(ctx context.Context, path string) error {
 }
 
 // StartOAuthFlow starts a temporary reverse-proxy HTTP server on callbackPort,
-// rewrites AH's appie:// redirect to the local /callback handler, exchanges
-// the auth code for tokens, saves them, and returns:
+// takes the auth code from AH's appie:// redirect as it passes the proxy,
+// exchanges it for tokens, saves them, and returns:
 //   - loginURL: the URL the user must open in their browser
 //   - done: a channel that receives nil on success or an error on failure/timeout
 //   - err: non-nil only if the server could not start
 //
 // The proxy approach is necessary because the AH OAuth server only accepts
-// redirect_uri=appie://login-exit (a custom iOS URL scheme). The proxy
-// intercepts this redirect and converts it to an HTTP callback we can receive.
+// redirect_uri=appie://login-exit (a custom iOS URL scheme), which a browser
+// cannot open. The proxy reads the code from that redirect itself.
 func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, tokensPath string) (loginURL string, done <-chan error, err error) {
 	addr := fmt.Sprintf("0.0.0.0:%d", callbackPort)
 	listener, listenErr := net.Listen("tcp", addr)
@@ -181,21 +182,6 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 	var doneServedOnce sync.Once
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			http.Error(w, "missing code", http.StatusBadRequest)
-			return
-		}
-		fmt.Fprintf(os.Stderr, "[ah-mcp] OAuth callback received (code len=%d)\n", len(code))
-		select {
-		case codeCh <- code:
-		default:
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, loginSuccessHTML)
-	})
-
 	mux.HandleFunc(loginDonePath, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		io.WriteString(w, loginSuccessHTML)
@@ -225,15 +211,8 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			doneURL := callbackHost + loginDonePath
-			if codeTaken.Load() && resp.Request.URL.Path == "/login/ingelogd" {
-				redirectTo(resp, doneURL)
-				return nil
-			}
-			if strings.HasSuffix(resp.Request.URL.Path, "/ingelogd.json") {
-				if err := captureNextRedirectCode(resp, codeCh, &codeTaken, doneURL); err != nil {
-					return err
-				}
+			if err := takeAuthorizationCode(resp, codeCh, &codeTaken, callbackHost+loginDonePath); err != nil {
+				return err
 			}
 			return rewriteOAuthResponse(resp, callbackHost, target.Host)
 		},
@@ -249,8 +228,8 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 
 	// Build the login URL that the user must open (via our local proxy).
 	loginURL = fmt.Sprintf(
-		"%s/secure/oauth/authorize?client_id=%s&response_type=code&redirect_uri=appie://login-exit",
-		callbackHost, ahClientID,
+		"%s/secure/oauth/authorize?client_id=%s&response_type=code&redirect_uri=%s",
+		callbackHost, ahClientID, appieRedirect,
 	)
 
 	// Wait for the code, exchange it, save tokens — all in background.
@@ -339,21 +318,11 @@ func doAHPost(ctx context.Context, path string, body, result any) error {
 }
 
 // rewriteOAuthResponse intercepts login.ah.nl responses and:
-//   - rewrites appie:// Location redirects to localOrigin/callback
 //   - strips security headers that block the proxy
 //   - sanitizes cookies for HTTP use on localhost
-//   - replaces appie:// and login.ah.nl URLs in HTML/JS/JSON bodies
+//   - replaces login.ah.nl URLs in HTML/JS/JSON bodies
 func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) error {
-	// Intercept server-side redirects to appie://
 	loc := resp.Header.Get("Location")
-	if strings.HasPrefix(loc, "appie://") {
-		u, err := url.Parse(loc)
-		if err != nil {
-			return fmt.Errorf("parse appie URL %q: %w", loc, err)
-		}
-		resp.Header.Set("Location", fmt.Sprintf("%s/callback?%s", localOrigin, u.Query().Encode()))
-		return nil
-	}
 	if strings.Contains(loc, targetHost) {
 		resp.Header.Set("Location", strings.ReplaceAll(loc, "https://"+targetHost, localOrigin))
 	}
@@ -383,7 +352,6 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 	if err != nil {
 		return err
 	}
-	body = bytes.ReplaceAll(body, []byte("appie://login-exit"), []byte(localOrigin+"/callback"))
 	body = bytes.ReplaceAll(body, []byte("https://"+targetHost), []byte(localOrigin))
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -408,13 +376,28 @@ func sanitizeCookie(cookie string) string {
 	return strings.Join(out, ";")
 }
 
-// captureNextRedirectCode takes the authorization code from the Next.js
-// __N_REDIRECT in ingelogd.json and sends the browser to doneURL. The login page
-// ignores the redirect in the first ingelogd.json response, the only one that
-// carries the code, and fetches the page again; so the code is taken from the
-// response itself, and once it is taken every ingelogd.json response redirects
-// to doneURL.
-func captureNextRedirectCode(resp *http.Response, codeCh chan<- string, taken *atomic.Bool, doneURL string) error {
+// takeAuthorizationCode hands the code from AH's appie://login-exit redirect to
+// codeCh and points the browser at doneURL instead. AH sends that redirect as a
+// 302 on a full page load, and as a Next.js __N_REDIRECT in ingelogd.json when
+// the login page navigates client-side. The page fetches ingelogd.json twice and
+// ignores the redirect in the first answer, which is the only one carrying the
+// code, so the code is taken from the response and later requests for the page
+// are redirected to doneURL.
+func takeAuthorizationCode(resp *http.Response, codeCh chan<- string, taken *atomic.Bool, doneURL string) error {
+	if loc := resp.Header.Get("Location"); strings.HasPrefix(loc, appieRedirect) {
+		deliverCode(codeCh, codeFromRedirect(loc))
+		taken.Store(true)
+		resp.Header.Set("Location", doneURL)
+		return nil
+	}
+	if taken.Load() && resp.Request.URL.Path == "/login/ingelogd" {
+		redirectTo(resp, doneURL)
+		return nil
+	}
+	if !strings.HasSuffix(resp.Request.URL.Path, "/ingelogd.json") {
+		return nil
+	}
+
 	body, err := readBody(resp)
 	if err != nil {
 		return err
@@ -426,12 +409,8 @@ func captureNextRedirectCode(resp *http.Response, codeCh chan<- string, taken *a
 	}
 	props, _ := page["pageProps"].(map[string]any)
 	redirect, _ := props["__N_REDIRECT"].(string)
-	if code := codeFromRedirect(redirect); code != "" {
-		fmt.Fprintf(os.Stderr, "[ah-mcp] OAuth code found in ingelogd.json (code len=%d)\n", len(code))
-		select {
-		case codeCh <- code:
-		default:
-		}
+	if strings.HasPrefix(redirect, appieRedirect) {
+		deliverCode(codeCh, codeFromRedirect(redirect))
 		taken.Store(true)
 	}
 	if !taken.Load() {
@@ -445,18 +424,6 @@ func captureNextRedirectCode(resp *http.Response, codeCh chan<- string, taken *a
 	}
 	setBody(resp, rewritten)
 	return nil
-}
-
-// codeFromRedirect returns the code query parameter of an appie:// redirect, or "".
-func codeFromRedirect(redirect string) string {
-	if !strings.HasPrefix(redirect, "appie://") {
-		return ""
-	}
-	u, err := url.Parse(redirect)
-	if err != nil {
-		return ""
-	}
-	return u.Query().Get("code")
 }
 
 // redirectTo turns resp into an empty 302 to location.
@@ -473,6 +440,29 @@ func setBody(resp *http.Response, body []byte) {
 	resp.Header.Del("Content-Encoding")
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
+}
+
+// codeFromRedirect returns the code query parameter of an appie:// redirect, or "".
+func codeFromRedirect(redirect string) string {
+	u, err := url.Parse(redirect)
+	if err != nil {
+		return ""
+	}
+	return u.Query().Get("code")
+}
+
+// deliverCode passes the first code on; later ones are dropped, because the
+// login page can expose the same login more than once and only one exchange
+// may run.
+func deliverCode(codeCh chan<- string, code string) {
+	if code == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[ah-mcp] OAuth code received (code len=%d)\n", len(code))
+	select {
+	case codeCh <- code:
+	default:
+	}
 }
 
 // readBody reads and returns the response body, handling gzip encoding.
